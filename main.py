@@ -1,7 +1,7 @@
 """
 Weather MCP Server
 支持 stdio 模式（本地）和 SSE 模式（远程部署）
-使用 Open-Meteo API，无需 API Key
+使用 wttr.in API，无需 API Key
 
 工具：
   - get_current_weather(city)       当前天气
@@ -33,7 +33,7 @@ WMO_CODES = {
     95: "雷暴", 96: "雷暴伴小冰雹", 99: "雷暴伴大冰雹",
 }
 
-# ── 地理编码 ───────────────────────────────────────────────────────────────────
+# ── HTTP 客户端 ─────────────────────────────────────────────────────────────────
 
 def _http_client() -> httpx.AsyncClient:
     """创建 HTTP 客户端，自动使用系统代理（如有）"""
@@ -45,70 +45,105 @@ def _http_client() -> httpx.AsyncClient:
         return httpx.AsyncClient(timeout=15, transport=transport)
     return httpx.AsyncClient(timeout=15)
 
+# ── 自动定位 ───────────────────────────────────────────────────────────────────
 
-async def geocode(city: str) -> tuple[float, float, str]:
-    url = "https://geocoding-api.open-meteo.com/v1/search"
-    params = {"name": city, "count": 1, "language": "zh", "format": "json"}
+_DEFAULT_CITY_CACHE: str | None = None
+_LOCATION_CACHE_TIME: float = 0
+_CACHE_DURATION = 3600  # 缓存1小时
+
+async def get_default_city() -> str:
+    """获取默认城市：优先环境变量 DEFAULT_CITY，其次 IP 定位"""
+    global _DEFAULT_CITY_CACHE, _LOCATION_CACHE_TIME
+
+    # 1. 环境变量
+    env_city = os.environ.get("DEFAULT_CITY", "").strip()
+    if env_city:
+        return env_city
+
+    # 2. 检查缓存是否有效
+    current_time = datetime.now().timestamp()
+    if _DEFAULT_CITY_CACHE is not None and (current_time - _LOCATION_CACHE_TIME) < _CACHE_DURATION:
+        return _DEFAULT_CITY_CACHE
+
+    # 3. 尝试多个定位服务
+    location_services = [
+        ("http://ip-api.com/json/?lang=zh", lambda d: d.get("city", "")),
+        ("http://ip-api.com/json/?fields=city", lambda d: d.get("city", "")),
+        ("https://ipinfo.io/json", lambda d: d.get("city", "")),
+        ("https://ipapi.co/json/", lambda d: d.get("city", "")),
+    ]
+
+    for url, extract_city in location_services:
+        try:
+            async with _http_client() as client:
+                resp = await client.get(url, timeout=5)
+                data = resp.json()
+                city = extract_city(data)
+                if city:
+                    _DEFAULT_CITY_CACHE = city
+                    _LOCATION_CACHE_TIME = current_time
+                    print(f"自动定位成功：{city}（使用 {url}）", file=sys.stderr)
+                    return city
+        except Exception as e:
+            print(f"定位服务 {url} 失败：{e}", file=sys.stderr)
+            continue
+
+    # 4. 所有服务都失败，返回空字符串
+    print("所有定位服务均失败，请手动设置城市或配置 DEFAULT_CITY 环境变量", file=sys.stderr)
+    return ""
+
+# ── API 请求（wttr.in）────────────────────────────────────────────────────────
+
+async def fetch_wttr(city: str) -> dict:
+    """从 wttr.in 获取天气数据（JSON 格式）"""
+    import urllib.parse
+    encoded_city = urllib.parse.quote(city)
+    url = f"https://wttr.in/{encoded_city}?format=j1"
     async with _http_client() as client:
-        resp = await client.get(url, params=params)
-        resp.raise_for_status()
-        data = resp.json()
-    results = data.get("results")
-    if not results:
-        raise ValueError(f"找不到城市：{city}")
-    r = results[0]
-    return r["latitude"], r["longitude"], r.get("name", city)
-
-# ── API 请求 ───────────────────────────────────────────────────────────────────
-
-async def fetch_open_meteo(lat: float, lon: float, params: dict) -> dict:
-    base = {"latitude": lat, "longitude": lon, "timezone": "auto"}
-    base.update(params)
-    async with _http_client() as client:
-        resp = await client.get("https://api.open-meteo.com/v1/forecast", params=base)
+        resp = await client.get(url)
         resp.raise_for_status()
         return resp.json()
 
 # ── 工具实现 ───────────────────────────────────────────────────────────────────
 
 async def tool_current_weather(city: str) -> str:
-    lat, lon, name = await geocode(city)
-    data = await fetch_open_meteo(lat, lon, {
-        "current": [
-            "temperature_2m", "relative_humidity_2m",
-            "apparent_temperature", "weather_code", "wind_speed_10m",
-        ]
-    })
-    c = data["current"]
-    desc = WMO_CODES.get(c.get("weather_code", -1), "未知")
+    data = await fetch_wttr(city)
+    area = data.get("nearest_area", [{}])[0]
+    name = area.get("areaName", [{}])[0].get("value", city)
+    c = data["current_condition"][0]
+    desc = c.get("lang_zh", [{}])[0].get("value", "") or c.get("weatherDesc", [{}])[0].get("value", "未知")
     return (
         f"{name} 当前天气\n"
         f"天气状况：{desc}\n"
-        f"温度：{c['temperature_2m']}°C（体感 {c['apparent_temperature']}°C）\n"
-        f"湿度：{c['relative_humidity_2m']}%\n"
-        f"风速：{c['wind_speed_10m']} km/h"
+        f"温度：{c['temp_C']}°C（体感 {c['FeelsLikeC']}°C）\n"
+        f"湿度：{c['humidity']}%\n"
+        f"风速：{c['windspeedKmph']} km/h"
     )
 
 
 async def tool_hourly_forecast(city: str, hours: int = 24) -> str:
     hours = max(1, min(hours, 48))  # 限制 1-48 小时
-    lat, lon, name = await geocode(city)
-    data = await fetch_open_meteo(lat, lon, {
-        "hourly": [
-            "temperature_2m", "weather_code",
-            "precipitation_probability", "wind_speed_10m",
-        ],
-        "forecast_hours": hours,
-    })
-    h = data["hourly"]
+    data = await fetch_wttr(city)
+    area = data.get("nearest_area", [{}])[0]
+    name = area.get("areaName", [{}])[0].get("value", city)
+    weather_days = data.get("weather", [])
     lines = [f"{name} 未来 {hours} 小时预报\n"]
-    for i in range(len(h["time"])):
-        t = h["time"][i][11:]  # 只取时间部分 HH:MM
-        desc = WMO_CODES.get(h["weather_code"][i], "未知")
-        temp = h["temperature_2m"][i]
-        pop = h["precipitation_probability"][i]
-        wind = h["wind_speed_10m"][i]
-        lines.append(f"{t}  {desc}  {temp}°C  降水概率:{pop}%  风速:{wind}km/h")
+    count = 0
+    for day in weather_days:
+        if count >= hours:
+            break
+        date = day.get("date", "")
+        for hour in day.get("hourly", []):
+            if count >= hours:
+                break
+            t = int(hour.get("time", "0")) // 100
+            t_str = f"{t:02d}:00"
+            desc = hour.get("lang_zh", [{}])[0].get("value", "") or hour.get("weatherDesc", [{}])[0].get("value", "未知")
+            temp = hour.get("tempC", "?")
+            pop = hour.get("chanceofrain", "0")
+            wind = hour.get("windspeedKmph", "0")
+            lines.append(f"{date} {t_str}  {desc}  {temp}°C  降水概率:{pop}%  风速:{wind}km/h")
+            count += 1
     return "\n".join(lines)
 
 
@@ -176,20 +211,30 @@ def _calculate_activity_score(weather_data: dict, activity: str) -> tuple[str, s
     """计算活动适宜度评分"""
     guidelines = _ACTIVITY_GUIDELINES.get(activity, _ACTIVITY_GUIDELINES["hiking"])
 
-    c = weather_data["current"]
-    hourly = weather_data.get("hourly", {})
+    c = weather_data["current_condition"][0]
+    hourly = weather_data.get("weather", [{}])[0].get("hourly", [])
 
     # 获取当前天气参数
-    temp = c["temperature_2m"]
-    weather_code = c["weather_code"]
-    wind_speed = c["wind_speed_10m"]
+    temp = float(c.get("temp_C", c.get("tempC", 0)))
+    # 映射 wttr.in 的天气描述到简化的天气状况评分
+    weather_desc = c.get("weatherDesc", [{}])[0].get("value", "").lower()
+    wind_speed = float(c["windspeedKmph"])
+    precip_prob = float(c.get("chanceofrain", 0))
 
-    # 获取未来降水概率（如果可用）
-    precip_prob = 0
-    if hourly and "precipitation_probability" in hourly:
-        # 取未来3小时平均降水概率
-        precip_probs = hourly["precipitation_probability"][:3]
-        precip_prob = sum(precip_probs) / len(precip_probs) if precip_probs else 0
+    # 根据天气描述判断天气代码（简化映射）
+    weather_code = 0  # 默认晴天
+    if "thunder" in weather_desc or "storm" in weather_desc:
+        weather_code = 95
+    elif "snow" in weather_desc or "sleet" in weather_desc:
+        weather_code = 71
+    elif "rain" in weather_desc or "drizzle" in weather_desc:
+        weather_code = 61
+    elif "fog" in weather_desc or "mist" in weather_desc:
+        weather_code = 45
+    elif "cloud" in weather_desc or "overcast" in weather_desc:
+        weather_code = 3
+    elif "partly" in weather_desc:
+        weather_code = 2
 
     # 计算评分
     score = 100
@@ -249,33 +294,25 @@ async def tool_activity_suggestion(city: str, activity: str = "hiking") -> str:
         valid_activities = ", ".join(_ACTIVITY_GUIDELINES.keys())
         return f"不支持的活動类型：{activity}\n支持的活动类型：{valid_activities}"
 
-    lat, lon, name = await geocode(city)
-
-    # 获取当前天气和未来3小时预报
-    data = await fetch_open_meteo(lat, lon, {
-        "current": [
-            "temperature_2m", "relative_humidity_2m",
-            "apparent_temperature", "weather_code", "wind_speed_10m",
-        ],
-        "hourly": ["precipitation_probability"],
-        "forecast_hours": 3,
-    })
+    data = await fetch_wttr(city)
+    area = data.get("nearest_area", [{}])[0]
+    name = area.get("areaName", [{}])[0].get("value", city)
 
     # 计算活动适宜度
     rating, tip, reasons = _calculate_activity_score(data, activity)
     activity_name = _ACTIVITY_GUIDELINES[activity]["name"]
 
-    c = data["current"]
-    desc = WMO_CODES.get(c["weather_code"], "未知")
+    c = data["current_condition"][0]
+    desc = c.get("lang_zh", [{}])[0].get("value", "") or c.get("weatherDesc", [{}])[0].get("value", "未知")
 
     # 构建返回信息
     lines = [
         f"📍 {name} - {activity_name}建议",
         "",
         f"🌡️ 当前天气：{desc}",
-        f"温度：{c['temperature_2m']}°C（体感 {c['apparent_temperature']}°C）",
-        f"湿度：{c['relative_humidity_2m']}%",
-        f"风速：{c['wind_speed_10m']} km/h",
+        f"温度：{c['temp_C']}°C（体感 {c['FeelsLikeC']}°C）",
+        f"湿度：{c['humidity']}%",
+        f"风速：{c['windspeedKmph']} km/h",
         "",
         f"✨ 适宜度评级：{rating.upper()}",
         "",
@@ -292,37 +329,38 @@ async def tool_activity_suggestion(city: str, activity: str = "hiking") -> str:
 
 # 预警阈值
 _ALERT_RULES = [
-    ("temperature_2m_max", ">", 37,  "高温预警", "最高气温 {val}°C，超过 37°C"),
-    ("temperature_2m_min", "<", 0,   "低温预警", "最低气温 {val}°C，低于 0°C"),
-    ("wind_speed_10m_max", ">", 60,  "大风预警", "最大风速 {val} km/h，超过 60 km/h"),
-    ("wind_speed_10m_max", ">", 40,  "风力提示", "最大风速 {val} km/h，超过 40 km/h"),
-    ("precipitation_sum",  ">", 50,  "暴雨预警", "日降水量 {val} mm，超过 50 mm"),
-    ("precipitation_sum",  ">", 25,  "大雨提示", "日降水量 {val} mm，超过 25 mm"),
+    ("maxtempC",  ">", 37,  "高温预警", "最高气温 {val}°C，超过 37°C"),
+    ("mintempC",  "<", 0,   "低温预警", "最低气温 {val}°C，低于 0°C"),
+    ("maxwind_speedKmph", ">", 60,  "大风预警", "最大风速 {val} km/h，超过 60 km/h"),
+    ("maxwind_speedKmph", ">", 40,  "风力提示", "最大风速 {val} km/h，超过 40 km/h"),
+    ("totalSnow_cm",  ">", 50,  "暴雪预警", "日降雪量 {val} cm，超过 50 cm"),
+    ("precipMM",  ">", 25,  "大雨提示", "日降水量 {val} mm，超过 25 mm"),
 ]
 
 async def tool_weather_alerts(city: str) -> str:
-    lat, lon, name = await geocode(city)
-    data = await fetch_open_meteo(lat, lon, {
-        "daily": [
-            "weather_code", "temperature_2m_max", "temperature_2m_min",
-            "precipitation_sum", "wind_speed_10m_max",
-        ],
-        "forecast_days": 3,
-    })
-    d = data["daily"]
+    data = await fetch_wttr(city)
+    area = data.get("nearest_area", [{}])[0]
+    name = area.get("areaName", [{}])[0].get("value", city)
+    weather_days = data.get("weather", [])
     alerts = []
-    for i, date in enumerate(d["time"]):
+    for day in weather_days:
+        date = day.get("date", "")
         day_alerts = []
         for field, op, threshold, title, tmpl in _ALERT_RULES:
-            val = d[field][i]
+            val = day.get(field)
             if val is None:
+                continue
+            try:
+                val = float(val)
+            except (ValueError, TypeError):
                 continue
             triggered = (op == ">" and val > threshold) or (op == "<" and val < threshold)
             if triggered:
                 day_alerts.append(f"  [{title}] {tmpl.format(val=val)}")
         if day_alerts:
-            desc = WMO_CODES.get(d["weather_code"][i], "未知")
-            alerts.append(f"{date} ({desc}):")
+            desc = day.get("hourly", [{}])[4]  # midday
+            weather_desc = desc.get("lang_zh", [{}])[0].get("value", "") if desc else ""
+            alerts.append(f"{date} ({weather_desc}):")
             alerts.extend(day_alerts)
 
     if not alerts:
@@ -338,48 +376,48 @@ async def list_tools() -> list[Tool]:
     return [
         Tool(
             name="get_current_weather",
-            description="查询指定城市的当前天气，包括温度、湿度、风速和天气状况",
+            description="查询指定城市的当前天气，包括温度、湿度、风速和天气状况。城市参数可留空，系统会自动通过IP定位获取当前位置",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "city": {"type": "string", "description": "城市名称，支持中文或英文"}
+                    "city": {"type": "string", "description": "城市名称，支持中文或英文。留空则通过IP自动定位获取当前位置"}
                 },
-                "required": ["city"],
+                "required": [],
             },
         ),
         Tool(
             name="get_hourly_forecast",
-            description="查询指定城市未来逐小时天气预报，包括温度、天气状况、降水概率、风速",
+            description="查询指定城市未来逐小时天气预报，包括温度、天气状况、降水概率、风速。城市参数可留空，系统会自动通过IP定位获取当前位置",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "city": {"type": "string", "description": "城市名称，支持中文或英文"},
+                    "city": {"type": "string", "description": "城市名称，支持中文或英文。留空则通过IP自动定位获取当前位置"},
                     "hours": {"type": "integer", "description": "预报小时数，1-48，默认24", "default": 24},
                 },
-                "required": ["city"],
+                "required": [],
             },
         ),
         Tool(
             name="get_weather_alerts",
-            description="查询指定城市未来3天气象预警，包括高温、低温、大风、暴雨等极端天气提示",
+            description="查询指定城市未来3天气象预警，包括高温、低温、大风、暴雨等极端天气提示。城市参数可留空，系统会自动通过IP定位获取当前位置",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "city": {"type": "string", "description": "城市名称，支持中文或英文"}
+                    "city": {"type": "string", "description": "城市名称，支持中文或英文。留空则通过IP自动定位获取当前位置"}
                 },
-                "required": ["city"],
+                "required": [],
             },
         ),
         Tool(
             name="get_activity_suggestion",
-            description="根据天气条件提供户外活动建议，支持爬山、跑步、骑行、野餐等活动，给出适宜度评级和建议",
+            description="根据天气条件提供户外活动建议，支持爬山、跑步、骑行、野餐等活动，给出适宜度评级和建议。城市参数可留空，系统会自动通过IP定位获取当前位置",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "city": {"type": "string", "description": "城市名称，支持中文或英文"},
+                    "city": {"type": "string", "description": "城市名称，支持中文或英文。留空则通过IP自动定位获取当前位置"},
                     "activity": {"type": "string", "description": "活动类型：hiking(爬山)、running(跑步)、cycling(骑行)、picnic(野餐)", "default": "hiking"},
                 },
-                "required": ["city"],
+                "required": [],
             },
         ),
     ]
@@ -389,7 +427,9 @@ async def list_tools() -> list[Tool]:
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     city = arguments.get("city", "").strip()
     if not city:
-        return [TextContent(type="text", text="错误：请提供城市名称")]
+        city = await get_default_city()
+    if not city:
+        return [TextContent(type="text", text="无法自动获取位置，请手动提供城市名称或设置 DEFAULT_CITY 环境变量")]
     try:
         if name == "get_current_weather":
             result = await tool_current_weather(city)

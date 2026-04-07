@@ -4,6 +4,10 @@
 
 ## 功能
 
+- **智能自动定位**：所有工具的城市参数均可留空，系统会自动通过IP定位获取当前位置
+  - 优先使用环境变量 `DEFAULT_CITY`
+  - 其次尝试多个IP定位服务（ip-api.com、ipinfo.io、ipapi.co）
+  - 定位结果缓存1小时，避免频繁请求
 - 工具：`get_current_weather(city)` — 查询任意城市当前天气
 - 工具：`get_hourly_forecast(city, hours)` — 查询未来逐小时天气预报
 - 工具：`get_weather_alerts(city)` — 查询未来3天气象预警
