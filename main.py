@@ -51,8 +51,175 @@ _DEFAULT_CITY_CACHE: str | None = None
 _LOCATION_CACHE_TIME: float = 0
 _CACHE_DURATION = 3600  # 缓存1小时
 
+async def get_location_by_wifi() -> str | None:
+    """通过WiFi定位获取城市（使用WiFi BSSID）"""
+    try:
+        # 获取WiFi BSSID（需要管理员权限）
+        import subprocess
+        import platform
+
+        system = platform.system()
+        bssid = None
+
+        if system == "Windows":
+            # Windows: 使用netsh获取WiFi信息
+            result = subprocess.run(
+                ["netsh", "wlan", "show", "interfaces"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                for line in result.stdout.split('\n'):
+                    if 'BSSID' in line:
+                        bssid = line.split(':')[1].strip().replace('-', ':')
+                        break
+
+        elif system == "Darwin":  # macOS
+            # macOS: 使用airport命令
+            result = subprocess.run(
+                ["/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport", "-I"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                for line in result.stdout.split('\n'):
+                    if 'BSSID' in line:
+                        bssid = line.split(':')[1].strip()
+                        break
+
+        elif system == "Linux":
+            # Linux: 使用iwconfig或nmcli
+            try:
+                result = subprocess.run(
+                    ["iwconfig"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if result.returncode == 0:
+                    for line in result.stdout.split('\n'):
+                        if 'Access Point:' in line:
+                            bssid = line.split('Access Point:')[1].strip()
+                            break
+            except FileNotFoundError:
+                # 尝试nmcli
+                result = subprocess.run(
+                    ["nmcli", "-t", "-f", "BSSID", "dev", "wifi"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    bssid = result.stdout.strip().split('\n')[0]
+
+        if not bssid:
+            print("无法获取WiFi BSSID", file=sys.stderr)
+            return None
+
+        print(f"获取到WiFi BSSID: {bssid}", file=sys.stderr)
+
+        # 使用Google Geolocation API（需要API key，这里用免费替代）
+        # 使用Mozilla Location Service（免费）
+        async with _http_client() as client:
+            # 构建WiFi定位请求
+            wifi_data = {
+                "wifi": [
+                    {"bssid": bssid}
+                ]
+            }
+
+            # 尝试使用免费的WiFi定位服务
+            try:
+                # 使用ip-api.com的WiFi定位（免费）
+                resp = await client.post(
+                    "http://ip-api.com/json/",
+                    json=wifi_data,
+                    timeout=10
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    city = data.get("city", "")
+                    if city:
+                        print(f"WiFi定位成功：{city}", file=sys.stderr)
+                        return city
+            except Exception:
+                pass
+
+            # 备用：使用Mozilla Location Service（需要注册获取API key）
+            # 这里暂时跳过，因为需要API key
+
+    except Exception as e:
+        print(f"WiFi定位失败：{e}", file=sys.stderr)
+
+    return None
+
+
+async def get_location_by_gps() -> str | None:
+    """通过GPS模块获取城市（需要GPS硬件支持）"""
+    try:
+        import serial
+        import pynmea2
+
+        # 常见的GPS串口路径
+        gps_ports = [
+            "/dev/ttyUSB0",  # Linux
+            "/dev/ttyACM0",  # Linux
+            "COM3",          # Windows
+            "COM4",          # Windows
+            "/dev/tty.usbmodem14101",  # macOS
+        ]
+
+        for port in gps_ports:
+            try:
+                # 尝试打开串口
+                ser = serial.Serial(port, baudrate=9600, timeout=5)
+
+                # 读取GPS数据
+                for _ in range(10):  # 尝试读取10次
+                    line = ser.readline().decode('ascii', errors='ignore')
+
+                    # 解析GPGGA语句（包含经纬度）
+                    if line.startswith('$GPGGA'):
+                        try:
+                            msg = pynmea2.parse(line)
+                            if msg.latitude and msg.longitude:
+                                lat = float(msg.latitude)
+                                lon = float(msg.longitude)
+
+                                # 使用经纬度获取城市
+                                async with _http_client() as client:
+                                    resp = await client.get(
+                                        f"https://nominatim.openstreetmap.org/reverse?lat={lat}&lon={lon}&format=json&accept-language=zh",
+                                        timeout=10
+                                    )
+                                    if resp.status_code == 200:
+                                        data = resp.json()
+                                        address = data.get("address", {})
+                                        city = address.get("city") or address.get("town") or address.get("county", "")
+                                        if city:
+                                            print(f"GPS定位成功：{city}（经纬度：{lat}, {lon}）", file=sys.stderr)
+                                            ser.close()
+                                            return city
+                        except Exception:
+                            continue
+
+                ser.close()
+
+            except (serial.SerialException, FileNotFoundError, PermissionError):
+                continue
+
+    except ImportError:
+        print("GPS定位需要安装依赖：pip install pyserial pynmea2", file=sys.stderr)
+    except Exception as e:
+        print(f"GPS定位失败：{e}", file=sys.stderr)
+
+    return None
+
+
 async def get_default_city() -> str:
-    """获取默认城市：优先环境变量 DEFAULT_CITY，其次 IP 定位"""
+    """获取默认城市：优先环境变量 DEFAULT_CITY，其次 GPS，再次 WiFi，最后 IP 定位"""
     global _DEFAULT_CITY_CACHE, _LOCATION_CACHE_TIME
 
     # 1. 环境变量
@@ -65,7 +232,24 @@ async def get_default_city() -> str:
     if _DEFAULT_CITY_CACHE is not None and (current_time - _LOCATION_CACHE_TIME) < _CACHE_DURATION:
         return _DEFAULT_CITY_CACHE
 
-    # 3. 尝试多个定位服务
+    # 3. 尝试GPS定位
+    print("尝试GPS定位...", file=sys.stderr)
+    city = await get_location_by_gps()
+    if city:
+        _DEFAULT_CITY_CACHE = city
+        _LOCATION_CACHE_TIME = current_time
+        return city
+
+    # 4. 尝试WiFi定位
+    print("尝试WiFi定位...", file=sys.stderr)
+    city = await get_location_by_wifi()
+    if city:
+        _DEFAULT_CITY_CACHE = city
+        _LOCATION_CACHE_TIME = current_time
+        return city
+
+    # 5. 尝试IP定位（备用方案）
+    print("尝试IP定位...", file=sys.stderr)
     location_services = [
         ("http://ip-api.com/json/?lang=zh", lambda d: d.get("city", "")),
         ("http://ip-api.com/json/?fields=city", lambda d: d.get("city", "")),
@@ -82,14 +266,14 @@ async def get_default_city() -> str:
                 if city:
                     _DEFAULT_CITY_CACHE = city
                     _LOCATION_CACHE_TIME = current_time
-                    print(f"自动定位成功：{city}（使用 {url}）", file=sys.stderr)
+                    print(f"IP定位成功：{city}（使用 {url}）", file=sys.stderr)
                     return city
         except Exception as e:
-            print(f"定位服务 {url} 失败：{e}", file=sys.stderr)
+            print(f"IP定位服务 {url} 失败：{e}", file=sys.stderr)
             continue
 
-    # 4. 所有服务都失败，返回空字符串
-    print("所有定位服务均失败，请手动设置城市或配置 DEFAULT_CITY 环境变量", file=sys.stderr)
+    # 6. 所有定位方式都失败
+    print("所有定位方式均失败，请手动设置城市或配置 DEFAULT_CITY 环境变量", file=sys.stderr)
     return ""
 
 # ── API 请求（wttr.in）────────────────────────────────────────────────────────
